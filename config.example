@@ -1,0 +1,18 @@
+# delta-helper config file.
+#
+# Install:
+#   mkdir -p ~/.config/delta-helper
+#   cp config.example ~/.config/delta-helper/config
+#   chmod 600 ~/.config/delta-helper/config    # readable only by you
+#   $EDITOR ~/.config/delta-helper/config
+#
+# Format: sh-syntax KEY=VALUE (sourced by the helpers on invocation).
+# Do NOT check the real file into git — it lives outside this repo.
+
+# Delta accounts (partition-scoped). Set only the ones you have.
+# `accounts` on a Delta login node prints your project codes.
+DELTA_ACCOUNT_CPU=CHANGEME-delta-cpu
+DELTA_ACCOUNT_GPU=CHANGEME-delta-gpu
+
+# DeltaAI allocation code (from `accounts` on a DeltaAI login node).
+# DELTAAI_ACCOUNT=CHANGEME

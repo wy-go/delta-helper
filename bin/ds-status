@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# ds-status — show your Slurm queue with a wide, useful format.
+set -euo pipefail
+
+WATCH=0
+INTERVAL=10
+USER_ARG="$USER"
+
+usage() {
+    cat <<'EOF'
+Usage: ds-status [options]
+
+Options:
+  -w, --watch          Refresh every 10s (Ctrl-C to exit).
+  --interval N         Watch interval in seconds (default: 10).
+  --user NAME          Show another user's jobs (default: $USER).
+  -h, --help           Show help.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -w|--watch)   WATCH=1; shift ;;
+        --interval)   INTERVAL="$2"; shift 2 ;;
+        --user)       USER_ARG="$2"; shift 2 ;;
+        -h|--help)    usage; exit 0 ;;
+        *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+FMT='%.12i %.20j %.16P %.10T %.10M %.10l %.4D %.6C %.5b %R'
+
+if [[ $WATCH -eq 1 ]]; then
+    exec watch -n "$INTERVAL" -t "squeue -u '$USER_ARG' -o '$FMT'"
+else
+    squeue -u "$USER_ARG" -o "$FMT"
+fi

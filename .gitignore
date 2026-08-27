@@ -1,0 +1,8 @@
+*.out
+*.err
+slurm-*.out
+slurm-*.err
+ddp_training_*.log
+*.swp
+.DS_Store
+__pycache__/

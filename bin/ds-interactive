@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# ds-interactive — salloc an interactive shell on Delta or DeltaAI.
+#
+# Auto-detects cluster from hostname (dt-login* -> delta, gh-login* -> dai).
+# Account resolution (first non-empty wins):
+#   --account CLI  >  env var  >  ~/.config/delta-helper/config
+# Config keys: DELTA_ACCOUNT_CPU, DELTA_ACCOUNT_GPU, DELTAAI_ACCOUNT
+# (Legacy DELTA_ACCOUNT / DELTAAI_ACCOUNT env vars are still honored.)
+set -euo pipefail
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/delta-helper/config"
+# shellcheck disable=SC1090
+[[ -r "$CONFIG_FILE" ]] && . "$CONFIG_FILE"
+
+usage() {
+    cat <<'EOF'
+Usage: ds-interactive [options]
+
+Options:
+  --cluster {delta,dai}   Force cluster (default: autodetect by hostname).
+  --gpu N                 Number of GPUs (default: 1 on Delta gpu*, 1 on DAI, 0 for delta-cpu).
+  --gpu-type TYPE         Delta only: a40 | a100 | a100x8 | h200 | mi100 (default: a40).
+  --cpu                   Delta only: request a CPU-only shell (no GPU).
+  --time HH:MM:SS         Wall time (default: 01:00:00; capped at partition limit).
+  --cpus N                CPUs per task (default: 8 on Delta gpu, 16 on Delta cpu, 16 on DAI).
+  --mem SIZE              Memory (default: 16g on Delta, 32g on DAI).
+  --account ACC           Slurm account (default: from ~/.config/delta-helper/config or env).
+  --dry-run               Print the salloc command without running it.
+  -h, --help              Show this help.
+
+Examples:
+  ds-interactive                          # 1h A40 GPU shell on Delta
+  ds-interactive --cluster dai            # 1h GH200 GPU shell on DeltaAI
+  ds-interactive --cpu --cpus 32 --mem 64g
+  ds-interactive --gpu-type a100 --time 2:00:00
+EOF
+}
+
+# Defaults
+CLUSTER=""
+GPU=""
+GPU_TYPE="a40"
+CPU_ONLY=0
+WALL="01:00:00"
+CPUS=""
+MEM=""
+ACCOUNT=""
+DRY=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cluster)   CLUSTER="$2"; shift 2 ;;
+        --gpu)       GPU="$2"; shift 2 ;;
+        --gpu-type)  GPU_TYPE="$2"; shift 2 ;;
+        --cpu)       CPU_ONLY=1; shift ;;
+        --time)      WALL="$2"; shift 2 ;;
+        --cpus)      CPUS="$2"; shift 2 ;;
+        --mem)       MEM="$2"; shift 2 ;;
+        --account)   ACCOUNT="$2"; shift 2 ;;
+        --dry-run)   DRY=1; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+# Autodetect cluster.
+if [[ -z "$CLUSTER" ]]; then
+    host=$(hostname -s)
+    case "$host" in
+        dt-login*|dt-*|cn*|gpu*)         CLUSTER=delta ;;
+        gh-login*|gh[0-9]*)              CLUSTER=dai ;;
+        *) echo "cannot detect cluster from hostname '$host'; pass --cluster" >&2; exit 2 ;;
+    esac
+fi
+
+case "$CLUSTER" in
+    delta)
+        if [[ $CPU_ONLY -eq 1 ]]; then
+            ACCOUNT="${ACCOUNT:-${DELTA_ACCOUNT_CPU:-${DELTA_ACCOUNT:-}}}"
+            PARTITION="cpu-interactive"
+            GPU="${GPU:-0}"
+            CPUS="${CPUS:-16}"
+            MEM="${MEM:-16g}"
+        else
+            ACCOUNT="${ACCOUNT:-${DELTA_ACCOUNT_GPU:-${DELTA_ACCOUNT:-}}}"
+            case "$GPU_TYPE" in
+                a40)    PARTITION="gpuA40x4-interactive" ;;
+                a100)   PARTITION="gpuA100x4-interactive" ;;
+                a100x8) PARTITION="gpuA100x8-interactive" ;;
+                h200)   PARTITION="gpuH200x8-interactive" ;;
+                mi100)  PARTITION="gpuMI100x8-interactive" ;;
+                *) echo "unknown --gpu-type: $GPU_TYPE" >&2; exit 2 ;;
+            esac
+            GPU="${GPU:-1}"
+            CPUS="${CPUS:-8}"
+            MEM="${MEM:-16g}"
+        fi
+        ;;
+    dai)
+        ACCOUNT="${ACCOUNT:-${DELTAAI_ACCOUNT:-}}"
+        PARTITION="ghx4-interactive"
+        GPU="${GPU:-1}"
+        CPUS="${CPUS:-16}"
+        MEM="${MEM:-32g}"
+        ;;
+    *) echo "unknown --cluster: $CLUSTER" >&2; exit 2 ;;
+esac
+
+if [[ -z "$ACCOUNT" ]]; then
+    echo "no account resolved.
+
+Set one of these (in order of precedence):
+  1. pass --account CODE
+  2. export DELTA_ACCOUNT_{CPU,GPU} or DELTAAI_ACCOUNT
+  3. create $CONFIG_FILE (see config.example in the repo)" >&2
+    exit 2
+fi
+
+cmd=(salloc
+    --account="$ACCOUNT"
+    --partition="$PARTITION"
+    --nodes=1
+    --ntasks=1
+    --cpus-per-task="$CPUS"
+    --mem="$MEM"
+    --time="$WALL")
+if [[ "$GPU" -gt 0 ]]; then
+    cmd+=(--gpus-per-node="$GPU")
+fi
+
+echo "+ ${cmd[*]}" >&2
+[[ $DRY -eq 1 ]] && exit 0
+exec "${cmd[@]}"

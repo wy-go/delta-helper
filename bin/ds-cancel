@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# ds-cancel — cancel Slurm jobs safely.
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: ds-cancel <JOBID> [JOBID ...]
+       ds-cancel --name PATTERN
+       ds-cancel --all
+       ds-cancel --pending          # only jobs in PD state
+       ds-cancel --state STATE      # e.g. RUNNING, PENDING
+
+--all, --name, --state, --pending prompt for confirmation before cancelling.
+EOF
+}
+
+confirm() {
+    read -r -p "$1 [y/N] " ans
+    [[ "$ans" == "y" || "$ans" == "Y" ]]
+}
+
+if [[ $# -eq 0 ]]; then usage >&2; exit 2; fi
+
+case "$1" in
+    -h|--help) usage; exit 0 ;;
+
+    --all)
+        jobs=$(squeue -u "$USER" -h -o '%i')
+        if [[ -z "$jobs" ]]; then echo "no jobs to cancel"; exit 0; fi
+        echo "About to cancel ALL of your jobs:"
+        squeue -u "$USER"
+        confirm "cancel these?" || { echo "aborted"; exit 1; }
+        scancel -u "$USER"
+        ;;
+
+    --pending)
+        jobs=$(squeue -u "$USER" -h -t PENDING -o '%i')
+        if [[ -z "$jobs" ]]; then echo "no pending jobs"; exit 0; fi
+        echo "About to cancel these pending jobs:"; echo "$jobs"
+        confirm "cancel these?" || { echo "aborted"; exit 1; }
+        scancel -u "$USER" -t PENDING
+        ;;
+
+    --state)
+        state="$2"
+        jobs=$(squeue -u "$USER" -h -t "$state" -o '%i')
+        if [[ -z "$jobs" ]]; then echo "no $state jobs"; exit 0; fi
+        echo "About to cancel these $state jobs:"; echo "$jobs"
+        confirm "cancel these?" || { echo "aborted"; exit 1; }
+        scancel -u "$USER" -t "$state"
+        ;;
+
+    --name)
+        pattern="$2"
+        jobs=$(squeue -u "$USER" -h -o '%i %j' | awk -v p="$pattern" '$2 ~ p {print $1}')
+        if [[ -z "$jobs" ]]; then echo "no jobs matching /$pattern/"; exit 0; fi
+        echo "About to cancel jobs whose name matches /$pattern/:"
+        squeue -u "$USER" -h -o '%i %j' | awk -v p="$pattern" '$2 ~ p'
+        confirm "cancel these?" || { echo "aborted"; exit 1; }
+        # shellcheck disable=SC2086
+        scancel $jobs
+        ;;
+
+    *)
+        # positional: job ids
+        for arg in "$@"; do
+            [[ "$arg" =~ ^[0-9_]+$ ]] || { echo "not a job id: $arg" >&2; exit 2; }
+        done
+        scancel "$@"
+        ;;
+esac
