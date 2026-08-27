@@ -89,6 +89,22 @@ Run any helper with `-h` for full options.
 | NCCL over Slingshot 11 | load `aws-ofi-nccl`; `NCCL_SOCKET_IFNAME=hsn` | loaded automatically; `NCCL_SOCKET_IFNAME=hsn` |
 | Preempt queues | yes (`*-preempt`, 0.25–0.5× charge) | not yet available |
 
+### Storage
+
+| Path | Use for | Notes |
+|---|---|---|
+| `/u/$USER` (HOME) | code, configs, small files | **not** for job I/O; 30-day snapshots |
+| `/scratch/<acct>/<user>/` | job I/O, experiment outputs | same Lustre volume as `/work/hdd`; not purged |
+| `/projects/<acct>/` | shared long-lived datasets | not purged |
+| `/work/nvme/…` | many-small-file I/O | available on request |
+| `/tmp` (per node) | in-job scratch | wiped after each job |
+
+`/scratch` and `/work/hdd` are the **same underlying volume** under two names —
+pick whichever path you prefer. Recommended layout for a project is
+`/scratch/<account>/<user>/<project>/`. See NCSA
+[Data Management docs](https://docs.ncsa.illinois.edu/systems/delta/en/latest/user_guide/data_mgmt.html)
+for exact quotas and how to request larger allocations.
+
 ### Delta filesystem constraints
 
 Add to any batch script that touches `/scratch`, `/projects`, `/work/hdd`,
