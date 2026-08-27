@@ -34,10 +34,12 @@ export LOGLEVEL=INFO
 export NCCL_DEBUG=INFO
 export NCCL_SOCKET_IFNAME=hsn
 
+# Your entrypoint — DDP / FSDP / DeepSpeed all launch through torchrun the same way;
+# the strategy is chosen inside the script, not here.
 srun torchrun \
     --nnodes "$SLURM_NNODES" \
     --nproc_per_node "$SLURM_GPUS_PER_NODE" \
     --rdzv_id "$RANDOM" \
     --rdzv_backend c10d \
     --rdzv_endpoint "$head_node_ip:29500" \
-    train_ddp.py "$@"
+    train.py "$@"

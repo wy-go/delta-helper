@@ -99,8 +99,8 @@ Run any helper with `-h` for full options.
 | `/work/nvme/…` | many-small-file I/O | available on request |
 | `/tmp` (per node) | in-job scratch | wiped after each job |
 
-`/scratch` and `/work/hdd` are the **same underlying volume** under two names —
-pick whichever path you prefer. Recommended layout for a project is
+`/scratch` and `/work/hdd` are the **same underlying volume** under two names.
+Recommended layout for a project is
 `/scratch/<account>/<user>/<project>/`. See NCSA
 [Data Management docs](https://docs.ncsa.illinois.edu/systems/delta/en/latest/user_guide/data_mgmt.html)
 for exact quotas and how to request larger allocations.
