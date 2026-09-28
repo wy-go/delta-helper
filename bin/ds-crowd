@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# ds-crowd — how crowded is each partition right now, and what does it cost?
+# Works on Delta and DeltaAI (reads whatever partitions this cluster has).
+set -euo pipefail
+
+usage() {
+    cat <<'EOF2'
+Usage: ds-crowd [options]
+
+Prints one row per partition, most crowded last:
+  nodes, idle nodes, partly used nodes, pending jobs, running jobs,
+  pending per running job (the crowding ratio), and the billing weight per GPU
+  (or per core on CPU partitions; regular queues are 1000 per unit).
+
+Options:
+  --gpu-only        Only partitions with GPUs.
+  -h, --help        Show help.
+
+A low pending/running ratio and some idle or partly used nodes mean a small job
+will likely start soon. A ratio of 5 or more means expect a long wait.
+EOF2
+}
+
+GPU_ONLY=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gpu-only) GPU_ONLY=1; shift ;;
+        -h|--help)  usage; exit 0 ;;
+        *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+printf "%-24s %6s %5s %6s %8s %8s %10s %12s\n" PARTITION NODES IDLE PARTLY PENDING RUNNING PEND/RUN BILL/UNIT
+for p in $(sinfo -h -o "%P" | tr -d '*' | sort -u); do
+    w=$(scontrol show partition "$p" 2>/dev/null | grep -oE 'TRESBillingWeights=[^ ]*' || true)
+    gpu=$(echo "$w" | grep -oE 'GRES/gpu=[0-9.]+' | cut -d= -f2 || true)
+    cpu=$(echo "$w" | grep -oE 'CPU=[0-9.]+' | head -1 | cut -d= -f2 || true)
+    [[ $GPU_ONLY -eq 1 && -z "$gpu" ]] && continue
+    read -r nodes idle mix < <(sinfo -h -p "$p" -o "%D %t" | awk '{t+=$1} $2=="idle"{i+=$1} $2 ~ /^mix/{m+=$1} END{print t+0, i+0, m+0}')
+    pd=$(squeue -h -p "$p" -t PD | wc -l)
+    rn=$(squeue -h -p "$p" -t R | wc -l)
+    ratio=$(awk -v a="$pd" -v b="$rn" 'BEGIN{ if (b==0) print (a==0 ? "0" : "inf"); else printf "%.1f", a/b }')
+    unit=${gpu:+"${gpu}/GPU"}; unit=${unit:-"${cpu:-?}/core"}
+    printf "%-24s %6s %5s %6s %8s %8s %10s %12s\n" "$p" "$nodes" "$idle" "$mix" "$pd" "$rn" "$ratio" "$unit"
+done | sort -k7,7g

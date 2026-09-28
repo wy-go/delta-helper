@@ -51,6 +51,7 @@ grouped at the top so they're easy to find. Comments explain each knob.
 | `ds-interactive` | `salloc` an interactive shell. Auto-detects cluster from hostname. |
 | `ds-status` | `squeue -u $USER` with a wider, more useful format. |
 | `ds-cancel` | Cancel by job id, by name pattern, or (with confirm) all of yours. |
+| `ds-crowd` | How crowded each partition is right now (pending, running, idle and partly used nodes) and its billing weight. Works on Delta and DeltaAI. |
 
 Examples:
 
@@ -69,6 +70,43 @@ ds-cancel --all          # every job of yours (prompts for confirmation)
 ```
 
 Run any helper with `-h` for full options.
+
+## Which partition starts soonest (and what it costs)
+
+Crowding changes by the hour, so check it live before choosing:
+
+```bash
+ds-crowd --gpu-only        # sorted by pending jobs per running job, least crowded first
+```
+
+Snapshot 2026-09-28 about 03:00 CDT, with the measured wait of a 1-GPU job (16 cores, 55-90 min wall) submitted to every lane at once.
+Billing is per GPU; the regular queue is 1000 = 1x. "Pending per running" above ~5 means expect a long wait.
+
+| cluster | partition | pending | running | pending per running | billing per GPU | measured start of a 1-GPU job |
+|---|---|---|---|---|---|---|
+| DeltaAI | `ghx4` | 1,098 | 286 | 3.8 | 1000 (1x) | **44 s** |
+| DeltaAI | `ghx4-interactive` | 18 | 15 | 1.2 | 2000 (2x) | 0 s, **but do not use: 2x price** |
+| Delta | `gpuA100x4` | 2,243 | 173 | 13.0 | 1000 (1x) | **31 min** (small short jobs backfill) |
+| Delta | `gpuA100x4-interactive` | 7 | 10 | 0.7 | 2000 (2x) | refused: one job per user per partition, slot held |
+| Delta | `gpuA100x8` | 370 | 34 | 10.9 | 1500 (1.5x) | not started after 31 min |
+| Delta | `gpuA40x4` | 776 | 311 | 2.5 | 500 (0.5x) | not started after 31 min |
+| Delta | `gpuH200x8` | 480 | 12 | 40.0 | 3000 (3x) | not started after 31 min |
+| Delta | `gpuH200x8-interactive` | 11 | 1 | 11.0 | 6000 (6x) | not tried (never use) |
+| Delta | `gpuA100x4-preempt`, `gpuA40x4-preempt` | ~100 each | 2 each | 50+ | 500 / 250 (0.5x / 0.25x) | not started after 31 min |
+
+What this means in practice:
+
+- **DeltaAI `ghx4` was the fastest GPU start by far**, at the regular price. It is ARM (aarch64): x86 Python environments do
+  not run there, so build a separate one on a `gh-login` node. It reads Delta's `/work/hdd` (= Delta `/scratch`) and `/projects`,
+  so data needs no copying; the home directory is separate.
+- **Never use `ghx4-interactive`**: it costs 2x and `ghx4` starts almost as fast.
+- **Delta interactive lanes cost 2x** and allow one job per user per partition; if another of your jobs holds the slot, new
+  submissions are refused (`QOSMaxSubmitJobPerUserLimit`).
+- **Delta preempt lanes are cheap but rarely start**: about 2 running against 100+ pending.
+- **Short, small jobs start sooner everywhere**: a tight `--time` and one GPU let Slurm backfill the job into gaps.
+- **H200 on Delta is the most crowded and the most expensive** (3x, 6x interactive).
+- Campus Cluster (ICC) availability is covered in `illinois-helper`; on 2026-09-28 all its A100/H200 GPUs were busy, and its A10 nodes
+  were held back (`PLANNED`) for an 8-GPU job, so idle-looking GPUs could not be used.
 
 ## Cluster cheat sheet
 
