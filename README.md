@@ -105,8 +105,8 @@ What this means in practice:
 - **Delta preempt lanes are cheap but rarely start**: about 2 running against 100+ pending.
 - **Short, small jobs start sooner everywhere**: a tight `--time` and one GPU let Slurm backfill the job into gaps.
 - **H200 on Delta is the most crowded and the most expensive** (3x, 6x interactive).
-- Campus Cluster (ICC) availability is covered in `illinois-helper`; on 2026-09-28 all its A100/H200 GPUs were busy, and its A10 nodes
-  were held back (`PLANNED`) for an 8-GPU job, so idle-looking GPUs could not be used.
+- Campus Cluster (ICC) availability is covered in `illinois-helper`. On 2026-09-28 all its A100/H200 GPUs were busy (a 1-GPU job
+  had not started after 33 min), while a 2 x A10 job on `eng-research-gpu` started in 44 s.
 
 ## Cluster cheat sheet
 
