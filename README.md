@@ -52,6 +52,8 @@ grouped at the top so they're easy to find. Comments explain each knob.
 | `ds-status` | `squeue -u $USER` with a wider, more useful format. |
 | `ds-cancel` | Cancel by job id, by name pattern, or (with confirm) all of yours. |
 | `ds-crowd` | How crowded each partition is right now (pending, running, idle and partly used nodes) and its billing weight. Works on Delta and DeltaAI. |
+| `submit-everywhere` | Submit one unit of work to every lane that can run it (Delta partitions, campus cluster and DeltaAI through ssh) as one duplicate group; records every job id in a group file. |
+| `dedup-reaper` | One loop (every 2 min, single instance) that cancels a group's extra copies once one runs, and all others once the unit is finished. |
 
 Examples:
 
@@ -70,6 +72,35 @@ ds-cancel --all          # every job of yours (prompts for confirmation)
 ```
 
 Run any helper with `-h` for full options.
+
+### Never wait on one queue: `submit-everywhere` and `dedup-reaper`
+
+```bash
+# one unit, every CPU lane on Delta and the campus cluster; the unit is finished when its output exists
+submit-everywhere --unit pal_slot3 --lanes delta-cpu --lanes icc-cpu --done-file /projects/bgwo/wanyu/x/slot3.done \
+    --expected-minutes 40 job.slurm slot3
+# every A100 lane, plus A40 as a second hardware type
+submit-everywhere --unit probe --lanes a100 --lanes a40 --hardware a100,a40 job.slurm
+# start the reaper once per site (state and lock on shared storage); check it
+setsid nohup dedup-reaper > /projects/bgwo/wanyu/coord_reaper/reaper_stdout.log 2>&1 < /dev/null &
+dedup-reaper --status
+```
+
+- Lanes: `--lane PARTITION:ACCOUNT[:CLUSTER[:HARDWARE[:normal|preempt]]]` or presets (`delta-cpu`, `icc-cpu`, `a100`, `a40`,
+  `h200`, `mi100`, `gh200`); `--hardware` keeps only the listed hardware types. Clusters `icc` and `deltaai` are reached by ssh
+  from a Delta login node (the campus connection lives on the node the owner logged in from); the script is copied to
+  `~/submit_everywhere/<group>/` there unless `--remote-script CLUSTER=PATH` names a copy, and its paths must exist there.
+- Every copy is named after the group id and carries `--comment=submit-everywhere:<group>`. The script must set a time limit;
+  the two costly interactive partitions are refused; a lane whose sbatch fails (for example the one-job-per-user interactive
+  limit) is reported and skipped.
+- The reaper (`/projects/bgwo/wanyu/coord_reaper/`: `groups/`, `reaper.lock` with host, pid and heartbeat, `reaper.log`) cancels
+  only job ids recorded in a group file, after checking the job's name is still the group id. Rule (site rule in
+  /u/wanyu/CLAUDE.md): once a normal copy runs, the other copies go; a preempt copy that had run 5 min or less when the normal
+  copy started yields; one that ran longer keeps the normal copy as insurance if 30 min or more remain, else the normal copy
+  goes; while only preempt copies run, pending normal copies stay. When the unit is finished (done file, or a copy that
+  completed with exit 0 if no done file is given) all other copies are cancelled. Give a done file whenever a copy can exit 0
+  without doing the work (for example when another copy holds the unit's claim).
+- Tests: `python3 tests/test_dedup_decide.py` (the rule); the end-to-end test of 2026-10-11 is in the commit message.
 
 ## Which partition starts soonest (and what it costs)
 

@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""dedup-reaper: cancel the extra copies of duplicate groups made by submit-everywhere.
+
+Usage:
+  dedup-reaper [--state-dir DIR] [--interval 120]        loop (single instance; lock with host, pid, heartbeat)
+  dedup-reaper --once [--dry-run]                        one pass (also takes the lock)
+  dedup-reaper --status                                  lock holder and every open group with its copies' states
+
+Every pass, for each open group in <state-dir>/groups/:
+  - unit finished (its --done-file exists; without one, a copy COMPLETED with exit 0): cancel every other copy, close the group;
+  - a copy runs on a normal lane: cancel the group's pending copies and later-started running copies; if a preempt copy was
+    already running, it yields when it had run 5 minutes or less at the normal copy's start; otherwise both are kept as
+    insurance when 30 minutes or more remain (from --expected-minutes, else the time limit), else the normal copy is cancelled;
+  - only preempt copies run: cancel the other preempt copies (pending or later-started); pending normal copies stay, so the
+    rule above applies when one starts;
+  - every copy ended without the unit finishing: the group is closed as "ended" and reported in the log.
+It only cancels job ids recorded in the group file, and only after sacct shows the job's name is still the group id.
+Every action is logged to <state-dir>/reaper.log and in the group's "events" list. Clusters that cannot be reached are
+skipped for that pass (their copies count as unknown and are never cancelled).
+"""
+import argparse
+import glob
+import json
+import os
+import signal
+import socket
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import slurm_lanes as sl  # noqa: E402
+
+HOST = socket.gethostname()
+PID = os.getpid()
+
+
+class LostLock(Exception):
+    pass
+
+
+def lock_path(state_dir):
+    return os.path.join(state_dir, "reaper.lock")
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def take_lock(state_dir, interval):
+    p = lock_path(state_dir)
+    stale_after = max(3 * interval, 300)
+    if os.path.exists(p):
+        try:
+            cur = sl.read_json(p)
+            age = (sl.now() - sl.dt.datetime.fromisoformat(cur["heartbeat"])).total_seconds()
+            same_host = cur.get("host") == HOST
+            if age < stale_after and not (same_host and not pid_alive(int(cur["pid"]))):
+                sys.exit("another reaper holds %s: host %s pid %s, heartbeat %.0f s ago" % (p, cur.get("host"), cur.get("pid"), age))
+        except (ValueError, KeyError, json.JSONDecodeError):
+            pass
+    mine = {"host": HOST, "pid": PID, "started": sl.iso(sl.now()), "heartbeat": sl.iso(sl.now()), "interval": interval}
+    sl.write_json_atomic(p, mine)
+    time.sleep(1.0)
+    cur = sl.read_json(p)
+    if cur.get("host") != HOST or int(cur.get("pid", -1)) != PID:
+        sys.exit("lost the race for %s to %s pid %s" % (p, cur.get("host"), cur.get("pid")))
+    return mine
+
+
+def heartbeat(state_dir, mine):
+    p = lock_path(state_dir)
+    cur = sl.read_json(p)
+    if cur.get("host") != HOST or int(cur.get("pid", -1)) != PID:
+        raise LostLock("lock now held by %s pid %s" % (cur.get("host"), cur.get("pid")))
+    mine["heartbeat"] = sl.iso(sl.now())
+    sl.write_json_atomic(p, mine)
+
+
+def release_lock(state_dir):
+    p = lock_path(state_dir)
+    try:
+        cur = sl.read_json(p)
+        if cur.get("host") == HOST and int(cur.get("pid", -1)) == PID:
+            os.remove(p)
+    except Exception:
+        pass
+
+
+def done_exists(spec):
+    if not spec:
+        return None
+    if ":" in spec and spec.split(":", 1)[0] in sl.CLUSTERS and not spec.startswith("/"):
+        cluster, path = spec.split(":", 1)
+        rc, out, err = sl.run_on(cluster, ["test", "-e", path], timeout=40)
+        if rc in (0, 1):
+            return rc == 0
+        return None  # unreachable: unknown
+    return os.path.exists(spec)
+
+
+def one_pass(state_dir, dry_run=False, verbose=False):
+    gdir = sl.groups_dir(state_dir)
+    paths = sorted(glob.glob(os.path.join(gdir, "*.json")))
+    groups = []
+    for p in paths:
+        try:
+            g = sl.read_json(p)
+        except Exception as e:
+            sl.log_line(state_dir, "unreadable group file %s: %r" % (p, e))
+            continue
+        if g.get("status") == "open":
+            groups.append((p, g))
+    by_cluster = {}
+    for _, g in groups:
+        for c in g["copies"]:
+            by_cluster.setdefault(c["cluster"], []).append(c["jobid"])
+    states = {}
+    for cluster, ids in by_cluster.items():
+        r = sl.query_states(cluster, sorted(set(ids)))
+        if r is None:
+            sl.log_line(state_dir, "cannot reach %s this pass; its copies count as unknown" % cluster)
+            continue
+        for jid, s in r.items():
+            states[(cluster, jid)] = s
+    t = sl.now()
+    for path, g in groups:
+        st = {}
+        for c in g["copies"]:
+            s = states.get((c["cluster"], c["jobid"]))
+            st[c["jobid"]] = {"s": sl.simple_state(s), "start": s and s["start"], "limit_min": s and s["limit_min"],
+                              "name": s and s["name"], "raw": s and s["state"]}
+        if g.get("done_file"):
+            done = done_exists(g["done_file"])
+            if done is None:
+                done = False
+        else:
+            done = any(v["s"] == "C" for v in st.values())
+        cancels, updates = sl.decide(g, st, t, done)
+        events = []
+        for jid, reason in cancels:
+            c = next(c for c in g["copies"] if c["jobid"] == jid)
+            if st[jid].get("name") != g["group"]:
+                events.append("REFUSED cancel of %s/%s: job name %r is not the group id" % (c["cluster"], jid, st[jid].get("name")))
+                continue
+            if dry_run:
+                events.append("would cancel %s/%s (%s, %s): %s" % (c["cluster"], c["partition"], jid, st[jid]["raw"], reason))
+                continue
+            rc, out, err = sl.run_on(c["cluster"], ["scancel", jid], timeout=60)
+            if rc == 0:
+                c["cancelled_by_reaper"] = sl.iso(sl.now())
+                events.append("cancelled %s/%s job %s (was %s): %s" % (c["cluster"], c["partition"], jid, st[jid]["raw"], reason))
+            else:
+                events.append("FAILED to cancel %s/%s job %s: %s" % (c["cluster"], c["partition"], jid,
+                                                                      (err.strip() or "rc=%d" % rc)[:200]))
+        if "insurance" in updates and updates["insurance"] != g.get("insurance"):
+            ins = updates["insurance"]
+            events.append("keeping preempt copy %s and normal copy %s both (insurance; about %s min remain)"
+                          % (ins["preempt"], ins["normal"], "?" if ins["remaining_min"] is None else "%.0f" % ins["remaining_min"]))
+        if updates.get("status") and not dry_run:
+            events.append("group closed: %s" % updates["status"])
+        for c in g["copies"]:
+            c["last_state"] = st[c["jobid"]]["raw"]
+        if verbose:
+            print("%s: %s" % (g["group"], ", ".join("%s/%s=%s" % (c["partition"], c["jobid"], st[c["jobid"]]["raw"])
+                                                     for c in g["copies"])))
+        for e in events:
+            line = sl.log_line(state_dir, "%s: %s" % (g["group"], e))
+            print(line.rstrip())
+        if dry_run:
+            continue
+        g.update(updates)
+        g["events"] = g.get("events", []) + ["%s %s" % (sl.iso(t), e) for e in events]
+        g["last_checked"] = sl.iso(t)
+        sl.write_json_atomic(path, g)
+        if g.get("status") != "open":
+            os.replace(path, os.path.join(gdir, "closed", os.path.basename(path)))
+    return len(groups)
+
+
+def status(state_dir):
+    p = lock_path(state_dir)
+    if os.path.exists(p):
+        cur = sl.read_json(p)
+        age = (sl.now() - sl.dt.datetime.fromisoformat(cur["heartbeat"])).total_seconds()
+        print("reaper: host %s pid %s, heartbeat %.0f s ago" % (cur.get("host"), cur.get("pid"), age))
+    else:
+        print("reaper: none running (no lock)")
+    one_pass(state_dir, dry_run=True, verbose=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Cancel extra copies of submit-everywhere groups.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--state-dir", default=sl.DEFAULT_STATE_DIR)
+    ap.add_argument("--interval", type=int, default=120, help="seconds between passes (default 120)")
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="print what would be cancelled; change nothing")
+    ap.add_argument("--status", action="store_true")
+    a = ap.parse_args()
+    os.makedirs(a.state_dir, exist_ok=True)
+    if a.status:
+        return status(a.state_dir)
+    if a.dry_run:
+        one_pass(a.state_dir, dry_run=True, verbose=True)
+        return 0
+    mine = take_lock(a.state_dir, a.interval)
+    stop = {"flag": False}
+
+    def on_term(sig, frm):
+        stop["flag"] = True
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    sl.log_line(a.state_dir, "reaper start (%s, interval %d s)" % ("once" if a.once else "loop", a.interval))
+    try:
+        while True:
+            try:
+                heartbeat(a.state_dir, mine)
+                n = one_pass(a.state_dir)
+                heartbeat(a.state_dir, mine)
+            except LostLock as e:
+                sl.log_line(a.state_dir, "reaper exits: %s" % e)
+                return 1
+            except Exception as e:
+                sl.log_line(a.state_dir, "pass error: %r" % e)
+            if a.once or stop["flag"]:
+                break
+            for _ in range(a.interval):
+                if stop["flag"]:
+                    break
+                time.sleep(1)
+            if stop["flag"]:
+                break
+    finally:
+        release_lock(a.state_dir)
+        sl.log_line(a.state_dir, "reaper stop")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

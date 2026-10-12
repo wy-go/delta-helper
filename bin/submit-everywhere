@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""submit-everywhere: submit one unit of work to every lane that can run it, as one duplicate group.
+
+Usage:
+  submit-everywhere --unit NAME [--lanes PRESET ...] [--lane PARTITION:ACCOUNT[:CLUSTER[:HARDWARE[:normal|preempt]]] ...]
+                    [--hardware a100,a40] [--done-file PATH | --done-file icc:PATH] [--expected-minutes N]
+                    [--sbatch-arg ARG ...] [--chdir DIR] [--remote-script CLUSTER=PATH] [--remote-chdir CLUSTER=DIR]
+                    [--state-dir DIR] [--dry-run] SCRIPT [SCRIPT_ARGS ...]
+
+  Presets: delta-cpu, icc-cpu, a100, a40, h200, mi100, gh200 (see slurm_lanes.PRESETS); clusters: delta (local), icc and
+  deltaai (through ssh from a Delta login node). Every copy gets job name = the group id and --comment=submit-everywhere:<group>.
+  The group file (<state-dir>/groups/<group>.json) records every job id submitted; dedup-reaper reads it, cancels the extra
+  copies once one runs (site rule for preempt copies) and all others once the unit is finished.
+
+Rules it enforces: the script (or --sbatch-arg) must set a time limit; the two costly interactive partitions are refused; a
+lane whose sbatch fails is reported and the other lanes still get their copy.
+
+The done file is how the reaper knows the unit is finished; give one whenever copies may exit 0 without doing the work (for
+example when another copy holds the unit's claim). Without it, a copy that completes with exit code 0 counts as finished.
+For icc / deltaai lanes the script is copied to ~/submit_everywhere/<group>/ on that cluster unless --remote-script names a
+copy already there; paths inside the script must exist on that cluster.
+"""
+import argparse
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import slurm_lanes as sl  # noqa: E402
+
+
+def has_time_limit(text, extra):
+    for a in extra:
+        if re.match(r"^(-t|--time)(=|$)|^-t\S", a):
+            return True
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("#SBATCH") and re.match(r"^#SBATCH\s+(-t\s*\S|--time[=\s])", s):
+            return True
+    return False
+
+
+def kv_list(items, what):
+    out = {}
+    for it in items or []:
+        if "=" not in it:
+            sys.exit("%s must be CLUSTER=VALUE: %s" % (what, it))
+        k, v = it.split("=", 1)
+        out[k] = v
+    return out
+
+
+def reaper_alive(state_dir):
+    try:
+        lock = sl.read_json(os.path.join(state_dir, "reaper.lock"))
+        hb = sl.dt.datetime.fromisoformat(lock["heartbeat"])
+        return (sl.now() - hb).total_seconds() < 600, lock
+    except Exception:
+        return False, None
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Submit one unit of work to every lane as a duplicate group.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--unit", required=True, help="plain name of the unit of work (used in the group id)")
+    ap.add_argument("--lane", action="append", default=[], help="PARTITION:ACCOUNT[:CLUSTER[:HARDWARE[:normal|preempt]]]")
+    ap.add_argument("--lanes", action="append", default=[], help="preset name: " + ", ".join(sorted(sl.PRESETS)))
+    ap.add_argument("--hardware", default=None, help="comma-separated hardware types allowed (default: all given lanes)")
+    ap.add_argument("--done-file", default=None, help="path whose existence means the unit is finished (prefix icc: or deltaai:)")
+    ap.add_argument("--expected-minutes", type=float, default=None, help="measured run time of one unit (else the time limit)")
+    ap.add_argument("--sbatch-arg", action="append", default=[], help="extra sbatch argument for every copy (repeatable)")
+    ap.add_argument("--chdir", default=None, help="working directory for Delta copies (default: current directory)")
+    ap.add_argument("--remote-script", action="append", default=[], help="CLUSTER=PATH of a script already on that cluster")
+    ap.add_argument("--remote-chdir", action="append", default=[], help="CLUSTER=DIR working directory on that cluster")
+    ap.add_argument("--state-dir", default=sl.DEFAULT_STATE_DIR)
+    ap.add_argument("--dry-run", action="store_true", help="print the sbatch commands, submit nothing")
+    ap.add_argument("script")
+    ap.add_argument("script_args", nargs=argparse.REMAINDER)
+    a = ap.parse_args()
+
+    specs = list(a.lane)
+    for p in a.lanes:
+        if p not in sl.PRESETS:
+            sys.exit("unknown preset %s (known: %s)" % (p, ", ".join(sorted(sl.PRESETS))))
+        specs += sl.PRESETS[p]
+    if not specs:
+        sys.exit("give at least one --lane or --lanes")
+    try:
+        lanes = [sl.parse_lane(s) for s in specs]
+    except ValueError as e:
+        sys.exit(str(e))
+    seen, uniq = set(), []
+    for l in lanes:
+        key = (l["cluster"], l["partition"], l["account"])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(l)
+    lanes = uniq
+    if a.hardware:
+        allowed = set(h.strip() for h in a.hardware.split(","))
+        skipped = [l for l in lanes if l["hardware"] not in allowed]
+        lanes = [l for l in lanes if l["hardware"] in allowed]
+        for l in skipped:
+            print("skip %s (%s): hardware %s not in --hardware" % (l["partition"], l["cluster"], l["hardware"]))
+    if not lanes:
+        sys.exit("no lanes left")
+
+    script = os.path.abspath(a.script)
+    with open(script) as f:
+        text = f.read()
+    if not has_time_limit(text, a.sbatch_arg):
+        sys.exit("refused: %s has no #SBATCH --time and no --sbatch-arg=--time=...; always set a time limit" % script)
+    remote_script = kv_list(a.remote_script, "--remote-script")
+    remote_chdir = kv_list(a.remote_chdir, "--remote-chdir")
+    chdir = os.path.abspath(a.chdir) if a.chdir else os.getcwd()
+
+    gid = sl.new_group_id(a.unit)
+    gdir = sl.groups_dir(a.state_dir)
+    group = {"group": gid, "unit": a.unit, "created": sl.iso(sl.now()), "script": script, "script_args": a.script_args,
+             "sbatch_args": a.sbatch_arg, "done_file": a.done_file, "expected_minutes": a.expected_minutes,
+             "status": "open", "copies": [], "failed_lanes": [], "events": [],
+             "submitted_from": "%s:%d" % (sl.socket.gethostname(), os.getpid())}
+    common = ["--parsable", "--job-name=%s" % gid, "--comment=submit-everywhere:%s" % gid]
+
+    for l in lanes:
+        argv = ["sbatch"] + common + ["--partition=%s" % l["partition"], "--account=%s" % l["account"]] + a.sbatch_arg
+        stdin = None
+        if l["cluster"] == "delta":
+            argv += ["--chdir=%s" % chdir, script] + a.script_args
+            shown = argv
+        else:
+            stage = "submit_everywhere/%s" % gid
+            if l["cluster"] in remote_script:
+                rpath = remote_script[l["cluster"]]
+                prep = ""
+            else:
+                rpath = "%s/%s" % (stage, os.path.basename(script))
+                prep = "mkdir -p %s && cat > %s && " % (stage, rpath)
+                stdin = text
+            wd = remote_chdir.get(l["cluster"], stage)  # ssh starts in the remote home, so relative paths are under it
+            inner = " ".join(sl.shell_quote(x) for x in argv + ["--chdir=%s" % wd, rpath] + a.script_args)
+            cmd = "%smkdir -p %s && %s" % (prep, sl.shell_quote(wd), inner)
+            shown = sl.CLUSTERS[l["cluster"]] + [cmd]
+        if a.dry_run:
+            print("dry run:", " ".join(shown))
+            continue
+        if l["cluster"] == "delta":
+            rc, out, err = sl.run_on("delta", argv, timeout=120)
+        else:
+            try:
+                p = sl.subprocess.run(shown, input=stdin, stdout=sl.subprocess.PIPE, stderr=sl.subprocess.PIPE,
+                                      universal_newlines=True, timeout=120)
+                rc, out, err = p.returncode, p.stdout, p.stderr
+            except Exception as e:
+                rc, out, err = 125, "", repr(e)
+        jid = out.strip().split(";")[0].strip().splitlines()[-1] if out.strip() else ""
+        if rc == 0 and jid.isdigit():
+            c = dict(l, jobid=jid, submitted=sl.iso(sl.now()))
+            group["copies"].append(c)
+            print("submitted %-24s %-8s %-16s job %s" % (l["partition"], l["cluster"], l["account"], jid))
+        else:
+            msg = (err.strip() or out.strip() or "rc=%d" % rc).splitlines()[-1][:300]
+            group["failed_lanes"].append(dict(l, error=msg))
+            print("FAILED    %-24s %-8s %-16s %s" % (l["partition"], l["cluster"], l["account"], msg))
+    if a.dry_run:
+        return 0
+    if not group["copies"]:
+        group["status"] = "ended"
+    path = os.path.join(gdir, gid + ".json")
+    sl.write_json_atomic(path, group)
+    sl.log_line(a.state_dir, "submit group %s: %s; failed lanes: %s" % (
+        gid, ", ".join("%s/%s=%s" % (c["cluster"], c["partition"], c["jobid"]) for c in group["copies"]) or "none",
+        ", ".join("%s/%s" % (c["cluster"], c["partition"]) for c in group["failed_lanes"]) or "none"))
+    print("group %s (%d copies) -> %s" % (gid, len(group["copies"]), path))
+    alive, lock = reaper_alive(a.state_dir)
+    if not alive:
+        print("WARNING: no live dedup-reaper for %s; start one (dedup-reaper --state-dir %s) or the extra copies stay queued."
+              % (a.state_dir, a.state_dir))
+    return 0 if group["copies"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
