@@ -54,6 +54,8 @@ grouped at the top so they're easy to find. Comments explain each knob.
 | `ds-crowd` | How crowded each partition is right now (pending, running, idle and partly used nodes) and its billing weight. Works on Delta and DeltaAI. |
 | `submit-everywhere` | Submit one unit of work to every lane that can run it (Delta partitions, campus cluster and DeltaAI through ssh) as one duplicate group; records every job id in a group file. |
 | `dedup-reaper` | One loop (every 2 min, single instance) that cancels a group's extra copies once one runs, and all others once the unit is finished. |
+| `pool-run` | Runs independent units in parallel on one machine (login node, job allocation, lent machine) with workers capped at free cores, library threads pinned, per-unit claims, a pool lock and a streamed results log. Also on ICC and CloudLab (plain Linux, Python 3.7+). |
+| `load-guard` | One-line alerts for a watchdog: load above cores, too many copies of one script, heavy processes on login nodes, a pool lock held twice, processes stuck in I/O wait on `/scratch`. |
 
 Examples:
 
@@ -101,6 +103,76 @@ dedup-reaper --status
   completed with exit 0 if no done file is given) all other copies are cancelled. Give a done file whenever a copy can exit 0
   without doing the work (for example when another copy holds the unit's claim).
 - Tests: `python3 tests/test_dedup_decide.py` (the rule); the end-to-end test of 2026-10-11 is in the commit message.
+
+### Correct parallelism by default: `pool-run` and `load-guard`
+
+Use `pool-run` for every batch of independent units (fits, simulations, evaluations), instead of a sequential loop or a
+hand-written `xargs`/`&` launcher; it applies the playbook's "Throughput check before every batch" rule by default.
+Run `load-guard` from every watchdog loop and before placing work on a shared or lent machine.
+
+```bash
+# units.txt: one unit per line, "ID<TAB>COMMAND"; a unit writes {tmp}, renamed to {out} when it exits 0
+printf 'fit_a\tpython fit.py --cfg a --out {tmp}\nfit_b\tpython fit.py --cfg b --out {tmp}\n' > units.txt
+pool-run --pool /projects/bgwo/wanyu/myexp/pool --units units.txt --out '/projects/bgwo/wanyu/myexp/out/{id}.json' --time-one
+pool-run --pool /projects/bgwo/wanyu/myexp/pool --units units.txt --out '/projects/bgwo/wanyu/myexp/out/{id}.json'
+pool-run --pool /projects/bgwo/wanyu/myexp/pool --template 'python fit.py --cfg {item} --out {tmp}' --items cfgs.txt --out 'out/{id}.json'
+pool-run --pool /projects/bgwo/wanyu/myexp/pool --units units.txt --status
+load-guard --hosts 'local,dt-login03,cloudlab-*' --alerts-only     # exit 1 and one line per alert
+```
+
+`pool-run`, what it does by default (`pool-run -h` has every option):
+
+- **Workers** = min(`--workers`, free cores // `--threads`), free cores = cores minus load, rounded down (after 0.25 core of measurement noise). Cores are this
+  process's CPUs (inside a Slurm job only the allocation); load is max(1-min load average, CPUs busy now) on a whole
+  machine and the CPUs busy now inside an allocation. It never runs more workers than fit, and refuses to start when none
+  fits (exit 3), unless `--force`. Login nodes (`dt-login*`, `gh-login*`, `cc-login*`) cap at `--login-max` 4.
+  `--mem-per-worker GB` also caps by available memory.
+- **Threads pinned**: `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, BLIS, vecLib,
+  Numba, `LOKY_MAX_CPU_COUNT` (joblib), Rayon, Polars and TensorFlow are set to `--threads` (default 1); LightGBM and
+  XGBoost follow `OMP_NUM_THREADS`. Code that passes `n_jobs`/`num_threads` itself should read `$POOL_RUN_THREADS`.
+  `--bind` also pins each worker to its own CPUs.
+- **Claims**: `<pool>/claims/<id>.json` (host, launcher pid, unit process group, lane), created atomically. On its own
+  host a claim is stale once its launcher is gone (unit processes left behind are killed at takeover); from another host,
+  once its heartbeat (mtime, every `--heartbeat` 30 s) is older than `--stale-seconds` 180. Copies of one pool on several
+  hosts or jobs (a shared `--pool` on `/projects`) split the units and never run a live unit twice; `--linger` keeps a
+  launcher waiting to take over stale claims instead of exiting (exit 6) when only other launchers' units remain.
+- **Outputs** temp-then-rename (`{tmp}` fsynced and renamed to `{out}` on exit 0); finished units are skipped, so the same
+  command resumes. `<pool>/done/<id>.json` marks units without `--out`. A failed unit is retried `--retries` (1) times.
+- **One launcher per pool and lane**: `<pool>/locks/<lane>.lock` (host, pid, heartbeat); the lane is the host, plus the
+  Slurm job id inside a job. A second launcher exits (exit 4), and so does another lane on the same host outside Slurm.
+- **Results stream**: one JSON line per finished unit (unit, status, rc, seconds, host, lane, attempt, out, log) is
+  appended to `<pool>/results.jsonl` and printed as `RESULT {...}`; per-unit logs in `<pool>/logs/`.
+- **`--time-one`** runs one unit (kept as a real result) and prints its time, units left, workers and the projected wall;
+  units measured alone are a lower bound when many share memory bandwidth.
+- **Nice 19** outside Slurm jobs (login nodes, lent machines). **dt-login02**: refuses (exit 7) when the pool, units,
+  outputs, results or working directory are on `/scratch` (= `/work/hdd`), whose I/O there hung for 4-7 min on
+  2026-10-13; run on dt-login03 or in a job (`--allow-scratch-here` overrides; `POOL_RUN_SCRATCH_HANG_HOSTS` sets the
+  host list).
+- Inside a job, give it the whole allocation: `#SBATCH --cpus-per-task=N` and `pool-run ...` with no `--workers`.
+
+`load-guard` checks each host (`local`, ssh aliases, patterns over `~/.ssh/config`) and prints `ALERT <host> <check>: ...`
+lines (exit 1) or `OK <host>: ...`:
+
+| check | alerts when |
+|---|---|
+| `load` | the 5-min load average (`--load-window`) exceeds the core count |
+| `copies` | more than `--max-copies` (default: core count) processes of one script run for the user |
+| `login-cpu` | on a login node, one process used more than `--login-cpu-minutes` (10) CPU-minutes at 20% or more of a core on average (`--min-util`); editors and agents skipped (`--ignore`) |
+| `pool-lock` | two `pool-run` launchers for one pool and lane on a host, two locks for one pool on a host outside Slurm, or a launcher without its lock; stale locks are `NOTE` lines |
+| `scratch-io` | a process in uninterruptible I/O wait (state D) on `/scratch` for more than `--dstate-minutes` (2) without using CPU; on dt-login02 (`--dstate-any-hosts`) every such stuck process is reported. Durations come from successive runs (state in `~/.cache/load-guard/dstate.json`), so run it every 1-5 min |
+| `unreachable` | ssh failed |
+
+There is no separate watchdog script in this repo; add `load-guard` to the session watchdog loop (or a Monitor):
+
+```bash
+load-guard --hosts 'local,dt-login03,cloudlab-*' --watch 120 --alerts-only   # prints new alerts with a time stamp; repeats every 30 min
+# or one pass inside an existing loop:  out=$(load-guard --hosts local,dt-login03 --alerts-only) || echo "$out"
+```
+
+As a library: `sys.path.insert(0, "/u/wanyu/github/delta-helper/bin"); from load_guard import check_hosts`
+(`check_hosts(["local"])` returns alert objects with `.line()`). Tests: `python3 tests/test_load_guard.py` (synthetic
+snapshots) and `python3 tests/test_pool_run.py` (end to end on the current machine; see the commit message for the
+2026-10-13 runs). `illinois-helper/bin` holds identical copies of both tools for ICC.
 
 ## Which partition starts soonest (and what it costs)
 
